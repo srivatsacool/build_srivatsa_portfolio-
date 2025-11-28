@@ -1,0 +1,93 @@
+name: CI / Deploy main site to VM
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Default target directory for the main website.
+  # Set TARGET_DIR as a repo secret if you want to override.
+  DEFAULT_TARGET_DIR: /var/www/main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      VM_USER: ${{ secrets.VM_USER }}
+      VM_HOST: ${{ secrets.VM_HOST }}
+      TARGET_DIR: ${{ secrets.TARGET_DIR || env.DEFAULT_TARGET_DIR }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js (if not needed, this step is harmless)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Configure SSH known_hosts (optional)
+        if: env.SSH_KNOWN_HOSTS != ''
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ env.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Start SSH agent and add private key
+        uses: webfactory/ssh-agent@v0.8.1
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Ensure rsync present on runner
+        run: sudo apt-get update && sudo apt-get install -y rsync
+
+      - name: Rsync build to remote VM
+        env:
+          VM_USER: ${{ env.VM_USER }}
+          VM_HOST: ${{ env.VM_HOST }}
+          TARGET_DIR: ${{ env.TARGET_DIR }}
+        run: |
+          # detect build output folder
+          BUILD_OUTPUT="./dist"
+          if [ ! -d "$BUILD_OUTPUT" ]; then
+            BUILD_OUTPUT="./build"
+          fi
+          if [ ! -d "$BUILD_OUTPUT" ]; then
+            echo "No build folder found (./dist or ./build). Listing repo root for debugging:"
+            ls -la
+            exit 1
+          fi
+          echo "Using build output: $BUILD_OUTPUT"
+          rsync -az --delete -e "ssh -o StrictHostKeyChecking=yes" \
+            --rsync-path="sudo rsync" \
+            "$BUILD_OUTPUT"/ ${VM_USER}@${VM_HOST}:${TARGET_DIR}/
+
+      - name: Fix permissions and reload nginx on VM
+        env:
+          VM_USER: ${{ env.VM_USER }}
+          VM_HOST: ${{ env.VM_HOST }}
+          TARGET_DIR: ${{ env.TARGET_DIR }}
+        run: |
+          ssh -o StrictHostKeyChecking=yes ${VM_USER}@${VM_HOST} <<'SSH_EOF'
+            # Ensure the target directory exists
+            sudo mkdir -p "${TARGET_DIR}"
+            # Adjust ownership to the web server user (www-data) — change if your server uses another user
+            sudo chown -R www-data:www-data "${TARGET_DIR}" || true
+            sudo chmod -R 755 "${TARGET_DIR}" || true
+            # Test nginx config then reload to pick up any changes (safe no-op for static sites)
+            if sudo nginx -t; then
+              sudo systemctl reload nginx || true
+            fi
+          SSH_EOF
