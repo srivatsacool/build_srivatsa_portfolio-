@@ -1,93 +1,99 @@
-name: CI / Deploy main site to VM
+name: Build and Atomic Deploy to VM
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
-
-permissions:
-  contents: read
+    branches: [ "main" ]
 
 env:
-  # Default target directory for the main website.
-  # Set TARGET_DIR as a repo secret if you want to override.
-  DEFAULT_TARGET_DIR: /var/www/main
+  REMOTE_BASE: /var/www          # <- change if you use a different base
+  SITE_NAME: main                # <- will create /var/www/releases/main and /var/www/main symlink
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    env:
-      VM_USER: ${{ secrets.VM_USER }}
-      VM_HOST: ${{ secrets.VM_HOST }}
-      TARGET_DIR: ${{ secrets.TARGET_DIR || env.DEFAULT_TARGET_DIR }}
-      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js (if not needed, this step is harmless)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'            # change if needed
           cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        run: npm run build
+      - name: Build site
+        run: npm run build             # must output build to ./dist
 
-      - name: Configure SSH known_hosts (optional)
-        if: env.SSH_KNOWN_HOSTS != ''
+      - name: Prepare SSH key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ env.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # known hosts to avoid interactive prompt
+          if [ -n "${{ secrets.KNOWN_HOSTS }}" ]; then
+            echo "${{ secrets.KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p ${{ secrets.SSH_PORT || '22' }} ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          fi
 
-      - name: Start SSH agent and add private key
-        uses: webfactory/ssh-agent@v0.8.1
+      - name: Create release name
+        id: release
+        run: |
+          ts=$(date -u +"%Y%m%d%H%M%S")
+          echo "RELEASE_DIR=releases/${{ env.SITE_NAME }}/$ts" >> $GITHUB_ENV
+          echo "RELEASE_SYMLINK=${{ env.SITE_NAME }}" >> $GITHUB_ENV
+
+      - name: Rsync built files to new release dir on server
+        env:
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          set -e
+          # remote target path (create parent dir if missing)
+          remote_parent="${{ env.REMOTE_BASE }}/releases/${{ env.SITE_NAME }}"
+          ssh -p ${SSH_PORT:-22} -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes $SSH_USER@$SSH_HOST "mkdir -p $remote_parent"
+          # rsync dist/ to a timestamped folder (we use the value from previous step)
+          remote_dir="${{ env.REMOTE_BASE }}/$RELEASE_DIR"
+          rsync -az --delete -e "ssh -p ${SSH_PORT:-22} -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes" ./dist/ \
+            $SSH_USER@$SSH_HOST:$remote_dir/
+
+      - name: Activate new release (atomic swap) on server
+        uses: appleboy/ssh-action@v0.1.8
         with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          script: |
+            set -e
+            REMOTE_BASE="${{ env.REMOTE_BASE }}"
+            SITE="${{ env.SITE_NAME }}"
+            RELEASE_DIR="$REMOTE_BASE/$RELEASE_DIR"
+            LIVE_LINK="$REMOTE_BASE/$SITE"
 
-      - name: Ensure rsync present on runner
-        run: sudo apt-get update && sudo apt-get install -y rsync
-
-      - name: Rsync build to remote VM
-        env:
-          VM_USER: ${{ env.VM_USER }}
-          VM_HOST: ${{ env.VM_HOST }}
-          TARGET_DIR: ${{ env.TARGET_DIR }}
-        run: |
-          # detect build output folder
-          BUILD_OUTPUT="./dist"
-          if [ ! -d "$BUILD_OUTPUT" ]; then
-            BUILD_OUTPUT="./build"
-          fi
-          if [ ! -d "$BUILD_OUTPUT" ]; then
-            echo "No build folder found (./dist or ./build). Listing repo root for debugging:"
-            ls -la
-            exit 1
-          fi
-          echo "Using build output: $BUILD_OUTPUT"
-          rsync -az --delete -e "ssh -o StrictHostKeyChecking=yes" \
-            --rsync-path="sudo rsync" \
-            "$BUILD_OUTPUT"/ ${VM_USER}@${VM_HOST}:${TARGET_DIR}/
-
-      - name: Fix permissions and reload nginx on VM
-        env:
-          VM_USER: ${{ env.VM_USER }}
-          VM_HOST: ${{ env.VM_HOST }}
-          TARGET_DIR: ${{ env.TARGET_DIR }}
-        run: |
-          ssh -o StrictHostKeyChecking=yes ${VM_USER}@${VM_HOST} <<'SSH_EOF'
-            # Ensure the target directory exists
-            sudo mkdir -p "${TARGET_DIR}"
-            # Adjust ownership to the web server user (www-data) — change if your server uses another user
-            sudo chown -R www-data:www-data "${TARGET_DIR}" || true
-            sudo chmod -R 755 "${TARGET_DIR}" || true
-            # Test nginx config then reload to pick up any changes (safe no-op for static sites)
-            if sudo nginx -t; then
-              sudo systemctl reload nginx || true
+            # Create releases dir if missing (safety)
+            mkdir -p "$(dirname "$RELEASE_DIR")"
+            if [ ! -d "$RELEASE_DIR" ]; then
+              echo "Release folder $RELEASE_DIR not found!"
+              exit 1
             fi
-          SSH_EOF
+
+            # Optional: keep only last 5 releases
+            ls -1dt "$REMOTE_BASE/releases/$SITE"/* 2>/dev/null | sed -n '6,$p' | xargs -r rm -rf --
+
+            # Atomically update symlink
+            ln -sfn "$RELEASE_DIR" "$LIVE_LINK"
+
+            # Set ownership to deploy user (optional, ensures webserver can read)
+            chown -R ${{ secrets.SSH_USER }}:${{ secrets.SSH_USER }} "$RELEASE_DIR" || true
+
+            # If you serve static files via nginx, you might want to restart/reload or clear cache
+            # Example: sudo systemctl reload nginx  (requires deploy user to have sudo without password)
+            # sudo systemctl reload nginx || true
+
+      - name: Deployment complete
+        run: echo "Deployed to ${{ secrets.SSH_HOST }}:$RELEASE_DIR and symlinked to /var/www/${{ env.SITE_NAME }}"
