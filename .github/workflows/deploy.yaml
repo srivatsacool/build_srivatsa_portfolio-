@@ -15,23 +15,26 @@ jobs:
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
           script: |
-            # 1. Load Node (NVM) environment
+            script: |
             export NVM_DIR=~/.nvm
             source ~/.nvm/nvm.sh
 
-            # 2. Stop current site to free up RAM
-            pm2 stop portfolio || true
+            # 1. Stop the current process (using the new name)
+            pm2 stop build_srivatsa || true
 
-            # 3. Go to folder and update code
-            cd ~/portfolio
+            # 2. Go to the CORRECT folder
+            cd ~/build_srivatsa
+            
+            # 3. Get latest code
             git pull origin main
             
             # 4. Install & Build
             npm install
             npm run build
             
-            # 5. Serve the 'dist' folder on Port 3000
-            # --spa handles routing for Astro
-            pm2 delete portfolio || true
-            pm2 serve dist/ 3000 --name "build.srivatsa" --spa
+            # 5. Serve using the new name
+            pm2 delete build_srivatsa || true
+            pm2 serve dist/ 3000 --name "build_srivatsa" --spa
+            
             pm2 save
+           
