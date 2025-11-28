@@ -1,0 +1,46 @@
+name: Deploy Main Portfolio
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to VM via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            # 1. Load Node (NVM) environment to ensure npm works
+            export NVM_DIR=~/.nvm
+            source ~/.nvm/nvm.sh
+
+            # 2. Stop the current process (using the CORRECT name)
+            # We stop it to free up RAM for the build
+            pm2 stop build_srivatsa || true
+
+            # 3. Go to the CORRECT folder
+            cd ~/build_srivatsa
+            
+            # 4. Get latest code
+            git pull origin main
+            
+            # 5. Install & Build
+            # (If npm install fails, run 'npm cache clean --force' manually once)
+            npm install
+            npm run build
+            
+            # 6. Serve using the CORRECT name
+            # We delete the old process first to update the settings
+            pm2 delete build_srivatsa || true
+            
+            # Serve the 'dist' folder on Port 3000
+            # --spa redirects 404s to index.html (Required for Astro/React routing)
+            pm2 serve dist/ 3000 --name "build_srivatsa" --spa
+            
+            # 7. Save PM2 list so it restarts if the server reboots
+            pm2 save
